@@ -1,0 +1,147 @@
+name: ResellCalc Public macOS Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      locale:
+        description: "Video locale"
+        required: true
+        default: "fr-FR"
+        type: choice
+        options:
+          - fr-FR
+
+permissions:
+  contents: read
+
+jobs:
+  video:
+    runs-on: macos-26
+    timeout-minutes: 55
+    env:
+      VIDEO_LOCALE: ${{ inputs.locale }}
+      RESELLCALC_SOURCE: ${{ github.workspace }}
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      EXPO_NO_GIT_STATUS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: "180000"
+
+    steps:
+      - name: Checkout private ResellCalc source
+        uses: actions/checkout@v4
+        with:
+          repository: OpertatorX/resellcalc-video-factory
+          ref: dd43b263bb35076f95063ff6374c44a2584bcfe4
+          ssh-key: ${{ secrets.RESELLCALC_PRIVATE_SSH_KEY }}
+          persist-credentials: false
+
+      - name: Verify private source
+        run: |
+          set -Eeuo pipefail
+          test -f App.js
+          test -f package.json
+          test -f factory/scripts/run_factory.sh
+          test -f factory/scripts/build_simulator.sh
+          test -f factory/scripts/capture.sh
+          test -f factory/scripts/render.sh
+          test -f factory/scripts/qc.py
+          echo "PRIVATE SOURCE: PASS"
+          echo "HEAD=$(git rev-parse HEAD)"
+
+      - name: Select Xcode 26.4.1
+        run: |
+          set -Eeuo pipefail
+          if [[ -d "/Applications/Xcode_26.4.1.app" ]]; then
+            sudo xcode-select -s "/Applications/Xcode_26.4.1.app/Contents/Developer"
+          elif [[ -d "/Applications/Xcode_26.4.app" ]]; then
+            sudo xcode-select -s "/Applications/Xcode_26.4.app/Contents/Developer"
+          else
+            echo "Xcode 26.4.1 not found; using runner default"
+          fi
+          xcodebuild -version
+          xcode-select -p
+          xcrun simctl list devices available
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Java 17 for Maestro
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Native build tools
+        run: |
+          set -Eeuo pipefail
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          pod --version
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Maestro
+        run: |
+          set -Eeuo pipefail
+          ok=0
+          for attempt in 1 2 3; do
+            if curl -fsSL "https://get.maestro.mobile.dev" | bash; then
+              ok=1
+              break
+            fi
+            echo "Maestro install retry $attempt"
+            sleep 4
+          done
+          test "$ok" = "1"
+          test -x "$HOME/.maestro/bin/maestro"
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          "$HOME/.maestro/bin/maestro" --version
+
+      - name: Static validation
+        run: |
+          set -Eeuo pipefail
+          chmod +x factory/scripts/*.sh factory/scripts/*.py
+          node --check factory/scripts/prepare_capture_source.mjs
+          python3 -m py_compile factory/scripts/*.py
+          for f in factory/scripts/*.sh; do bash -n "$f"; done
+          ruby -e 'require "yaml"; YAML.load_stream(File.read(ARGV[0])); puts "YAML PASS"' factory/scenarios/resellcalc_profit_fr.yaml
+          ffmpeg -hide_banner -filters > /tmp/ffmpeg-filters.txt 2>&1
+          grep -q 'drawtext' /tmp/ffmpeg-filters.txt
+          ffmpeg -hide_banner -encoders > /tmp/ffmpeg-encoders.txt 2>&1
+          grep -q 'libx264' /tmp/ffmpeg-encoders.txt
+          echo "STATIC VALIDATION: PASS"
+
+      - name: Produce validated video
+        run: ./factory/scripts/run_factory.sh
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resellcalc-video-diagnostics-${{ inputs.locale }}
+          if-no-files-found: ignore
+          path: |
+            .video-factory-work/xcodebuild.log
+            .video-factory-work/record.log
+            .video-factory-work/failure.png
+            .video-factory-work/capture-runtime-report.json
+            .video-factory-work/maestro-output/**
+            factory/output/**
+          retention-days: 7
+
+      - name: Upload validated video
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resellcalc-video-${{ inputs.locale }}
+          path: |
+            factory/output/ResellCalc-profit-${{ inputs.locale }}.mp4
+            factory/output/qc-report.json
+          retention-days: 30
